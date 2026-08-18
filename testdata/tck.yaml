@@ -1,0 +1,6 @@
+# Compatibility-test-kit config for the sbx-kits-contrib e2e harness.
+# The prompt subtest runs: sbx exec <sandbox> -- dsh --profile headless "<prompt>"
+# The headless profile answers one task on stdout and exits; without a bound
+# DeepSeek credential it prints a MISSING_CREDENTIAL line, which still proves the
+# CLI booted its profile tree inside the sandbox.
+promptArgs: ["--profile", "headless"]

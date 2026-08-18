@@ -1,0 +1,60 @@
+#!/bin/sh
+# Bridge a sandbox-reachable port to dsh's loopback-only Web UI.
+#
+# `dsh web` accepts only 127.0.0.1 or 0.0.0.0 as its bind host, and the CLI
+# rejects 0.0.0.0 outright ("it would expose remote code execution to the
+# network"). A sandbox's published port, though, is forwarded to the container's
+# eth0 address, which loopback never answers. This bridge is the seam: dsh keeps
+# its loopback-only posture, and the only thing listening on the container's
+# network interface is a dumb TCP forwarder we control.
+#
+# Started by the kit's startup hook on every container start. Safe to run by
+# hand; safe to run twice.
+set -eu
+
+LISTEN_PORT="${DSH_BRIDGE_PORT:-3081}"
+TARGET_PORT="${DSH_WEB_PORT:-3080}"
+
+log() { echo "dsh-web-bridge: $*"; }
+
+# Idempotence: a second copy would only lose the bind race and exit noisily.
+# Probed by connecting rather than by listing sockets — the sandbox template
+# ships neither `ss` nor `netstat`, and node is guaranteed (it runs dsh).
+already_served() {
+  node -e '
+    const net = require("node:net")
+    const s = net.connect(Number(process.argv[1]), "127.0.0.1")
+    s.setTimeout(1000)
+    s.on("connect", () => { s.destroy(); process.exit(0) })
+    s.on("timeout", () => { s.destroy(); process.exit(1) })
+    s.on("error", () => process.exit(1))
+  ' "${LISTEN_PORT}" > /dev/null 2>&1
+}
+
+if already_served; then
+  log "port ${LISTEN_PORT} already served; nothing to do"
+  exit 0
+fi
+
+log "forwarding 0.0.0.0:${LISTEN_PORT} -> 127.0.0.1:${TARGET_PORT}"
+
+if command -v socat > /dev/null 2>&1; then
+  exec socat "TCP-LISTEN:${LISTEN_PORT},bind=0.0.0.0,fork,reuseaddr" \
+             "TCP:127.0.0.1:${TARGET_PORT}"
+fi
+
+# Fallback for an image without socat. node is always present: it is what runs
+# dsh. Raw TCP piping, so the UI's WebSocket upgrade rides through untouched.
+log "socat not found; falling back to the node forwarder"
+exec node -e '
+const net = require("node:net")
+const listen = Number(process.argv[1])
+const target = Number(process.argv[2])
+net.createServer((from) => {
+  const to = net.connect(target, "127.0.0.1")
+  from.on("error", () => to.destroy())
+  to.on("error", () => from.destroy())
+  from.pipe(to)
+  to.pipe(from)
+}).listen(listen, "0.0.0.0")
+' "${LISTEN_PORT}" "${TARGET_PORT}"

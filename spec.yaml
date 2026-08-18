@@ -1,0 +1,182 @@
+schemaVersion: "2"
+kind: sandbox
+name: dsh
+displayName: DeepSeek Harness (dsh)
+description: >-
+  Run DeepSeek Harness (dsh) inside a Docker Sandbox. Interactive sessions serve
+  the harness Web UI on a published port; --task runs answer one prompt through
+  the headless profile. The DeepSeek API key stays on the host and is injected by
+  the sandbox proxy.
+sourceURL: https://github.com/deepseek-ai/deepseek-harness
+licenses:
+  - Apache-2.0
+
+# The two knobs worth changing are literals rather than a v2 `args:` block. The
+# published grammar has one, but sbx v0.38.0 rejects it outright under strict
+# decoding — `field args not found in type spec.specFileV2` — and there is no
+# --kit-arg flag to supply values with. Revisit when a release ships both.
+#
+#   - the pinned dsh version: `setup.install` below
+#   - dsh's own permission preset: `DSH_PERMISSION_MODE` under `environment`
+#
+# Both are one-line edits in a fork.
+
+sandbox:
+  # Ubuntu 26.04 template: ships Node 22.22 (dsh needs ^22.19 || >=24), socat,
+  # curl, git and a passwordless-sudo `agent` user, so the kit installs one
+  # npm package and nothing else.
+  image: docker/sandbox-templates:shell-docker
+  entrypoint:
+    - dsh
+  command:
+    # Interactive (TTY): serve the Web UI. dsh binds it to loopback only; the
+    # startup bridge below is what makes it reachable on the published port.
+    interactive:
+      - web
+    # Non-interactive / `sbx run --task "…"`: one persisted session, final answer
+    # on stdout, exit 0 on completion. Opens no port and mounts no web surface.
+    default:
+      - --profile
+      - headless
+
+agentInstructions:
+  filename: AGENTS.md
+  content: |
+    ## Sandbox environment
+
+    You are DeepSeek Harness (`dsh`) running inside a Docker Sandbox. The
+    workspace is mounted at its absolute host path and is the directory `dsh`
+    was started in. `sudo` is passwordless.
+
+    Outbound network access is deny-by-default. Only `api.deepseek.com` and
+    `registry.npmjs.org` are reachable; anything else fails with an HTTP 403
+    from the sandbox proxy whose body explains the block. Do not treat those
+    403s as a bug in the code you are working on — the user must extend the
+    kit's `permissions.network.allow` list or run
+    `sbx policy allow network <domain>`.
+
+    `apt-get` in particular will fail as a whole, even for a package you could
+    otherwise reach: `apt-get update` refreshes every source in
+    `/etc/apt/sources.list.d/`, this image pre-adds Docker's repo, and one
+    blocked source makes the whole run exit non-zero. Reaching for `apt-get`
+    needs `archive.ubuntu.com`, `security.ubuntu.com`, `ports.ubuntu.com`, and
+    `download.docker.com` allowed together. Say so rather than retrying.
+
+    The DeepSeek API key is not in this container. `DEEPSEEK_API_KEY` holds a
+    sentinel value; the sandbox proxy swaps in the real key on requests to
+    `api.deepseek.com`. Never copy that sentinel into a config file, and never
+    ask the user to paste their real key here.
+
+    ## Web UI
+
+    In interactive sessions `dsh web` serves the UI on `127.0.0.1:3080` inside
+    the container, bridged to container port 3081, which the runtime publishes
+    on an ephemeral host port. The user finds it with `sbx ports <sandbox>`.
+    Do not start replacement servers or change the bind address.
+
+permissions:
+  network:
+    allow:
+      # `npm install -g @deepseek-ai/dsh` at create time, and `dsh plugin …`
+      # (pnpm) later. Package tarballs are served from this same host.
+      - registry.npmjs.org
+      # Chat completions for the `deepseek-official` route, and the
+      # /anthropic/v1 endpoint the built-in web_search tool calls.
+      - api.deepseek.com
+    # Not allowed on purpose, and worth knowing about:
+    #   harness-telemetry.deepseeksvc.com — dsh's OTLP session-telemetry
+    #     exporter. It is DISABLED by default upstream; this kit leaves that
+    #     default alone and simply does not allow the host, so a stray
+    #     DSH_TELEMETRY_MODE cannot quietly ship session logs off the box.
+    #   archive.ubuntu.com / ports.ubuntu.com / pypi.org / github.com — add
+    #     them here (fork the kit) if the agent needs to install packages.
+
+ports:
+  # The bridge, not dsh itself: dsh refuses to bind anything but 127.0.0.1.
+  # Host ports are allocated ephemerally on 127.0.0.1 by the runtime; pin one
+  # with `sbx ports <sandbox> --publish 3081:3081` if you want a stable URL.
+  - container: 3081
+    protocol: tcp
+    name: dsh-web
+
+credentials:
+  - service: deepseek
+    description: DeepSeek platform API key (https://platform.deepseek.com/)
+    apiKey:
+      name: DEEPSEEK_API_KEY
+      proxyManaged: true
+      inject:
+        # The chat-completions adapter sends `authorization: Bearer <key>`.
+        # Spelled out rather than via `scheme: bearer`: sbx v0.38 normalizes that
+        # sugar to an empty `header` instead of expanding it to `Authorization`.
+        - domain: api.deepseek.com
+          header: Authorization
+          format: Bearer %s
+        # The web-search provider talks to api.deepseek.com/anthropic/v1 and
+        # sends x-api-key as well, so the proxy has to fill both headers.
+        - domain: api.deepseek.com
+          header: x-api-key
+          format: '%s'
+
+environment:
+  variables:
+    # dsh's own sandbox backends (bubblewrap, Landlock) are unusable inside a
+    # sandbox container — no user namespaces, and the sandbox kernel does not
+    # enforce Landlock — and `dsh-sandbox-local` fails closed rather than
+    # running a command unconfined. `danger-full-access` bypasses that provider
+    # entirely and sets the approval policy to `never`, which is also what the
+    # headless/--task surface needs to run without a human at the keyboard.
+    # The sandbox itself remains the boundary.
+    # Change to `workspace-write` only on an image where bubblewrap or Landlock
+    # actually works, otherwise every bash call fails closed.
+    DSH_PERMISSION_MODE: danger-full-access
+    # $DSH_HOME defaults to ~/.dsh, which is on the persistent home volume, so
+    # profiles, settings, credentials and session logs survive restarts. Stated
+    # explicitly so a future change of the default cannot move a live sandbox's
+    # data out from under it.
+    DSH_HOME: /home/agent/.dsh
+
+setup:
+  install:
+    - command: |
+        set -eu
+        npm config set proxy "$HTTP_PROXY"
+        npm config set https-proxy "$HTTPS_PROXY"
+        # dsh is a developer preview with compatibility-breaking changes between
+        # releases. Pin an exact version here (e.g. @0.1.0-rc.7) for anything you
+        # need to reproduce.
+        i=0
+        until npm install -g --no-fund --no-audit "@deepseek-ai/dsh@latest"; do
+          i=$((i + 1))
+          [ "$i" -ge 5 ] && exit 1
+          echo "npm install failed, retrying ($i/5)…"
+          sleep 5
+        done
+      user: "1000"
+      description: Install the dsh CLI from npm into the agent's global prefix
+    - command: |
+        set -eu
+        dsh --profile web --dump-config > /dev/null
+        echo "dsh $(dsh --version) installed; web profile initialized"
+        # Say out loud whether a DeepSeek credential got wired, so a missing
+        # host-side binding surfaces here instead of as a MISSING_CREDENTIAL
+        # error on the user's first prompt.
+        case "${SBX_CRED_DEEPSEEK_MODE:-none}" in
+          apikey) echo "deepseek credential: wired (proxy-managed)" ;;
+          *)      echo "deepseek credential: NOT wired — run 'sbx secret set deepseek -t <key>' on the host, or set a key in the Web UI's Settings -> Models page" ;;
+        esac
+      user: "1000"
+      description: >-
+        Materialize $DSH_HOME/profiles/web at create time so the first
+        interactive session starts in about a second instead of re-linking the
+        profile's module tree on demand
+  startup:
+    - command:
+        - sh
+        - -c
+        - setsid /home/agent/.local/bin/dsh-web-bridge > /tmp/dsh-web-bridge.log 2>&1 < /dev/null &
+      user: "1000"
+      background: true
+      description: >-
+        Expose dsh's loopback-only Web UI on container port 3081 so the runtime
+        can publish it
