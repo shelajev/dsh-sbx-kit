@@ -1,0 +1,44 @@
+name: Validate sbx kit
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v5
+
+      - name: Install sbx
+        run: |
+          curl -fsSL https://get.docker.com | sudo REPO_ONLY=1 sh
+          sudo apt-get update
+          sudo apt-get install -y docker-sbx
+
+      - name: Show sbx version
+        run: sbx version
+
+      - name: Validate kit directory
+        run: sbx kit validate .
+
+      - name: Inspect kit
+        run: sbx kit inspect .
+
+      - name: Pack and validate kit artifact
+        run: |
+          sbx kit pack . -o /tmp/dsh-kit.zip
+          sbx kit validate /tmp/dsh-kit.zip
+
+      - name: Check script syntax
+        run: |
+          bash -n run.sh
+          sh -n files/home/.local/bin/dsh-web-bridge
